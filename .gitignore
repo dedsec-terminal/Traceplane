@@ -1,0 +1,9 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+*.pyc
+*.pyo
+out.csv
+test.ndjson
+build.py
