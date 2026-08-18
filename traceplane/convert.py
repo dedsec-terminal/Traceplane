@@ -3,8 +3,18 @@ import csv
 import json
 import tempfile
 
+import multiprocessing
+from functools import partial
+
 from .flatten import flatten_dict, unflatten_dict
 from .query import apply_filters, matches_where
+from .parser import parse_where, evaluate
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
 def get_actual_path(input_path):
     if input_path == '-':
@@ -100,6 +110,38 @@ def get_chained_input(actual_paths):
         iterators.append(it)
     return chain(*iterators), is_flat_overall
 
+def _process_chunk(chunk, is_flattened, flatten_sep, array_sep, explode_arrays, parsed_where, fields, exclude_fields, sample, dedup):
+    # Process a chunk of items in a worker process
+    import random
+    results = []
+    for line_no, raw_obj in chunk:
+        if is_flattened:
+            flat_dicts = [raw_obj]
+        else:
+            flat_dicts = flatten_dict(raw_obj, sep=flatten_sep, array_sep=array_sep, explode_arrays=explode_arrays)
+
+        for d in flat_dicts:
+            matched = True
+            for ast in parsed_where:
+                if not evaluate(ast, d):
+                    matched = False
+                    break
+            if not matched:
+                continue
+
+            if sample is not None:
+                if random.random() > sample:
+                    continue
+
+            d = apply_filters(d, fields, exclude_fields)
+
+            if dedup:
+                h = hash(frozenset((k, str(v)) for k, v in d.items()))
+                results.append((line_no, d, h))
+            else:
+                results.append((line_no, d, None))
+    return results
+
 def convert(input_paths, output_path, to_json=False, ndjson_out=False, tsv=False, yaml_out=False,
             fields=None, exclude_fields=None, flatten_sep='.', array_sep=';', explode_arrays=False,
             where_filters=None, dedup=False, schema_file=None, preserve_strings=None,
@@ -121,19 +163,38 @@ def convert(input_paths, output_path, to_json=False, ndjson_out=False, tsv=False
     columns = set()
     needs_two_passes = not (to_json or ndjson_out or yaml_out)
     
+    chunk_size = 1000
+
+    parsed_where = []
+    if where_filters:
+        parsed_where = [parse_where(w) for w in where_filters]
+
+    def chunk_generator(iterator):
+        chunk = []
+        for item in iterator:
+            chunk.append(item)
+            if len(chunk) >= chunk_size:
+                yield chunk
+                chunk = []
+        if chunk:
+            yield chunk
+
     if needs_two_passes:
         iterator, is_flattened = get_chained_input(actual_paths)
-        for line_no, raw_obj in iterator:
-            if is_flattened:
-                flat_dicts = [raw_obj]
-            else:
-                flat_dicts = flatten_dict(raw_obj, sep=flatten_sep, array_sep=array_sep, explode_arrays=explode_arrays)
-                
-            for d in flat_dicts:
-                if not matches_where(d, where_filters):
-                    continue
-                d = apply_filters(d, fields, exclude_fields)
+        chunks = chunk_generator(iterator)
+
+        worker_func = partial(_process_chunk, is_flattened=is_flattened, flatten_sep=flatten_sep,
+                              array_sep=array_sep, explode_arrays=explode_arrays,
+                              parsed_where=parsed_where, fields=fields,
+                              exclude_fields=exclude_fields, sample=sample, dedup=False)
+
+        pool = multiprocessing.Pool()
+        # No tqdm on the first pass to keep it clean, but could add it
+        for res_chunk in pool.imap(worker_func, chunks):
+            for _, d, _ in res_chunk:
                 columns.update(d.keys())
+        pool.close()
+        pool.join()
                 
     header = sorted(list(columns)) if columns else []
 
@@ -159,33 +220,32 @@ def convert(input_paths, output_path, to_json=False, ndjson_out=False, tsv=False
         all_objects = []
         
         iterator, is_flattened = get_chained_input(actual_paths)
-        for line_no, raw_obj in iterator:
-            if is_flattened:
-                flat_dicts = [raw_obj]
-            else:
-                flat_dicts = flatten_dict(raw_obj, sep=flatten_sep, array_sep=array_sep, explode_arrays=explode_arrays)
-                
-            for d in flat_dicts:
-                if not matches_where(d, where_filters):
-                    continue
-                
-                if sample is not None:
-                    import random
-                    if random.random() > sample:
-                        continue
-                
-                match_count += 1
-                if offset is not None and match_count <= offset:
-                    continue
-                
-                d = apply_filters(d, fields, exclude_fields)
-                
+        chunks = chunk_generator(iterator)
+
+        worker_func = partial(_process_chunk, is_flattened=is_flattened, flatten_sep=flatten_sep,
+                              array_sep=array_sep, explode_arrays=explode_arrays,
+                              parsed_where=parsed_where, fields=fields,
+                              exclude_fields=exclude_fields, sample=sample, dedup=dedup)
+
+        pool = multiprocessing.Pool()
+        result_iterator = pool.imap(worker_func, chunks)
+
+        if HAS_TQDM and out_f is not sys.stdout:
+            result_iterator = tqdm(result_iterator, desc="Processing chunks", unit="chunk")
+
+        should_break = False
+
+        for res_chunk in result_iterator:
+            for line_no, d, h in res_chunk:
                 if dedup:
-                    h = hash(frozenset((k, str(v)) for k, v in d.items()))
                     if h in seen_hashes:
                         continue
                     seen_hashes.add(h)
                     
+                match_count += 1
+                if offset is not None and match_count <= offset:
+                    continue
+
                 if not needs_two_passes:
                     try:
                         out_obj = unflatten_dict(
@@ -195,6 +255,7 @@ def convert(input_paths, output_path, to_json=False, ndjson_out=False, tsv=False
                             line_no=line_no, strict=strict
                         )
                     except ValueError as e:
+                        pool.terminate()
                         print(f"Error: {e}", file=sys.stderr)
                         sys.exit(1)
                     if ndjson_out:
@@ -206,10 +267,16 @@ def convert(input_paths, output_path, to_json=False, ndjson_out=False, tsv=False
                 
                 output_count += 1
                 if limit is not None and output_count >= limit:
+                    should_break = True
                     break
-            else:
-                continue
-            break
+
+            if should_break:
+                pool.terminate()
+                break
+
+        if not should_break:
+            pool.close()
+        pool.join()
                     
         if to_json:
             json.dump(all_objects, out_f, indent=2)
