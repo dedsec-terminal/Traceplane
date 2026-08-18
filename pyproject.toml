@@ -19,7 +19,6 @@ yaml = ["pyyaml"]
 parquet = ["pyarrow", "pandas"]
 sqlite = ["sqlite-utils"]
 progress = ["tqdm"]
-tdigest = ["tdigest"]
 
 [project.scripts]
 traceplane = "traceplane.cli:main"
