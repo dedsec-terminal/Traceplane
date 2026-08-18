@@ -20,12 +20,37 @@ def split_key(key: str, sep: str) -> list:
     parts.append(''.join(current))
     return parts
 
-def unflatten_dict(d, sep='.'):
+def unflatten_dict(d, sep='.', schema=None, preserve_strings=None, keep_as_string=False, null_value='', line_no=None, strict=False):
+    if schema is None:
+        schema = {}
+    if preserve_strings is None:
+        preserve_strings = []
+
     result = {}
     for k, v in d.items():
-        if v == '' or v is None:
+        is_explicit_null = False
+        if isinstance(v, str) and v == null_value:
+            v = None
+            is_explicit_null = True
+
+        # In original traceplane, empty string '' was skipped.
+        # We preserve this behavior for CSV empty cells, but if it was explicitly
+        # the null_value (which defaults to ''), it becomes None and we don't skip it.
+        # However, to avoid breaking CSV -> JSON by adding `{"col": null}` everywhere,
+        # we will skip `None` if `null_value == ''` and it was parsed from `''`.
+        # Actually, let's keep it simple: if it's the null_value, it's None.
+        if v == '' and not is_explicit_null:
             continue
             
+        # We don't skip `v is None` anymore, so JSON -> JSON preserves `null`!
+        # Except if null_value is '' and we just converted '' to None from CSV.
+        # If the user wants to skip CSV empty cells, they shouldn't set null_value=''.
+        # Wait, the prompt says default is empty. If default is '', then CSV '' becomes None.
+        # Then we output `{"col": null}` for all empty CSV cells.
+        # To preserve old behavior where empty CSV cells are omitted, let's omit `None` if it was from `''` by default?
+        if v is None and is_explicit_null and null_value == '':
+            continue
+
         parts = split_key(k, sep)
         current = result
         for i, part in enumerate(parts[:-1]):
@@ -41,20 +66,43 @@ def unflatten_dict(d, sep='.'):
         last_part = parts[-1].replace(sep * 2, sep)
         
         if isinstance(v, str):
-            if v.lower() == 'true':
-                v = True
-            elif v.lower() == 'false':
-                v = False
-            elif v.lower() in ('null', 'none'):
-                v = None
-            else:
-                try:
-                    if '.' in v:
-                        v = float(v)
-                    else:
-                        v = int(v)
+            field_type = schema.get(k)
+            should_preserve = keep_as_string or (k in preserve_strings)
+            
+            if field_type == 'string':
+                pass # keep as string
+            elif field_type == 'int':
+                try: v = int(v)
                 except ValueError:
-                    pass
+                    if strict:
+                        raise ValueError(f"Line {line_no}: could not coerce '{k}' ('{v}') to int")
+                    import sys
+                    print(f"Warning: line {line_no} - could not coerce '{k}' ('{v}') to int", file=sys.stderr)
+            elif field_type == 'float':
+                try: v = float(v)
+                except ValueError:
+                    if strict:
+                        raise ValueError(f"Line {line_no}: could not coerce '{k}' ('{v}') to float")
+                    import sys
+                    print(f"Warning: line {line_no} - could not coerce '{k}' ('{v}') to float", file=sys.stderr)
+            elif field_type == 'boolean' or field_type == 'bool':
+                v = v.lower() == 'true'
+            elif not should_preserve:
+                # Default implicit coercion
+                if v.lower() == 'true':
+                    v = True
+                elif v.lower() == 'false':
+                    v = False
+                elif v.lower() in ('null', 'none'):
+                    v = None
+                else:
+                    try:
+                        if '.' in v:
+                            v = float(v)
+                        else:
+                            v = int(v)
+                    except ValueError:
+                        pass
                     
         current[last_part] = v
         

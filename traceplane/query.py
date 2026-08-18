@@ -1,18 +1,18 @@
+from .parser import parse_where, evaluate
+
+_where_cache = {}
+
 def matches_where(d: dict, where_filters: list) -> bool:
     if not where_filters:
         return True
     for flt in where_filters:
-        if '~' in flt and ('=' not in flt or flt.index('~') < flt.index('=')):
-            k, v = flt.split('~', 1)
-            val = str(d.get(k, ''))
-            if v not in val:
-                return False
-        elif '=' in flt:
-            k, v = flt.split('=', 1)
-            val = str(d.get(k, ''))
-            if val != v:
-                return False
-        else:
+        if flt not in _where_cache:
+            # Fallback to old simple format if parsing fails (for backward compatibility)
+            # Actually, parse_where handles 'a=b' correctly!
+            _where_cache[flt] = parse_where(flt)
+            
+        ast = _where_cache[flt]
+        if not evaluate(ast, d):
             return False
     return True
 

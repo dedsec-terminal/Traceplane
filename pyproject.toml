@@ -16,6 +16,9 @@ dependencies = []
 
 [project.optional-dependencies]
 yaml = ["pyyaml"]
+parquet = ["pyarrow", "pandas"]
+sqlite = ["sqlite-utils"]
+progress = ["tqdm"]
 
 [project.scripts]
 traceplane = "traceplane.cli:main"
