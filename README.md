@@ -55,6 +55,10 @@ traceplane convert huge_logs.ndjson -o filtered.csv --where "status_code=500" --
 traceplane stats input.json --field status_code
 ```
 
+## Known Limitations
+
+Type inference on CSV/TSV -> JSON conversion (--to-json) treats numeric-looking strings as numbers. A field like a zero-padded ID ("007") or a phone number stored as a string will be silently converted to an integer on round-trip, since CSV has no native type information to preserve the distinction. This is a limitation shared by essentially all JSON<->CSV tools, not specific to Traceplane. If exact string preservation matters for a specific field, keep the field out of CSV-format workflows entirely, or post-process the output JSON to cast the field back to a string.
+
 ## License
 
 See [LICENSE](LICENSE) for details.
